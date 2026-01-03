@@ -22,6 +22,9 @@
 import sys
 import ctypes
 import time
+import os
+import socket
+import datetime
 import collections
 import json
 import ast
@@ -31,6 +34,34 @@ from helper_funcs import *
 from log_ts import log_ts
 from gnuradio import gr
 import gnuradio.op25_repeater as op25_repeater
+
+# Optional MQTT/HA publisher for talkgroup total durations
+try:
+    from mqtt_ha import HaMqttTalkgroupTotals
+except Exception:
+    HaMqttTalkgroupTotals = None
+
+try:
+    # python3.9+
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+
+def _next_midnight_ts(now_ts, tz_name="America/Chicago"):
+    """Return epoch seconds for next local midnight in the provided tz."""
+    try:
+        if ZoneInfo is not None:
+            tz = ZoneInfo(tz_name)
+            now_dt = datetime.datetime.fromtimestamp(float(now_ts), tz)
+            nxt = (now_dt + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return float(nxt.timestamp())
+    except Exception:
+        pass
+    # Fallback: localtime (no DST-safe guarantees if tz differs)
+    lt = time.localtime(float(now_ts))
+    today_midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+    return float(today_midnight + 86400.0)
 
 def get_tgid(tgid):
     if tgid is not None:
@@ -92,7 +123,6 @@ class trunked_system (object):
 
     def set_debug(self, dbglvl):
         self.debug = dbglvl
-
     def reset(self):
         self.freq_table = {}
         self.stats = {}
@@ -1227,7 +1257,7 @@ def get_int_dict(s):
     return dict.fromkeys(d)
 
 class rx_ctl (object):
-    def __init__(self, debug=0, frequency_set=None, conf_file=None, logfile_workers=None, meta_update=None, crypt_behavior=0, nbfm_ctrl=None, fa_ctrl=None, chans={}):
+    def __init__(self, debug=0, frequency_set=None, conf_file=None, logfile_workers=None, meta_update=None, crypt_behavior=0, nbfm_ctrl=None, fa_ctrl=None, mqtt_config=None, chans={}):
         class _states(object):
             ACQ = 0
             CC = 1
@@ -1270,6 +1300,26 @@ class rx_ctl (object):
         self.last_tune_time = 0.0;
         self.last_tune_freq = 0;
 
+        # Talkgroup total duration tracking (seconds)
+        # - In scan mode (rx.py), durations are measured from TO_VC start until return to CC.
+        # - In logfile_workers mode (recording scheduler), durations are measured from first activity
+        #   until the talkgroup expires (no updates for TGID_HOLD_TIME).
+        self.tg_total_seconds = {}     # tgid -> float seconds
+        self._tg_active_since = {}     # tgid -> start timestamp
+        self._tg_tags = {}             # tgid -> last known tag/name
+        self._mqtt = None
+        self._mqtt_last_snapshot = 0.0
+        self._mqtt_snapshot_interval = 5.0
+        self._mqtt_last_state_publish = 0.0
+        self._mqtt_reset_daily = False
+        self._mqtt_tz_name = (mqtt_config or {}).get('tz') or os.environ.get('OP25_MQTT_TZ') or "America/Chicago"
+        self._mqtt_next_reset_ts = None
+        self._init_mqtt(mqtt_config)
+        if (mqtt_config or {}).get('reset_daily') or os.environ.get('OP25_MQTT_RESET_DAILY') in ['1','true','True']:
+            self._mqtt_reset_daily = True
+            self._mqtt_next_reset_ts = _next_midnight_ts(time.time(), self._mqtt_tz_name)
+
+
         if self.logfile_workers:
             self.input_rate = self.logfile_workers[0]['demod'].input_rate
 
@@ -1287,6 +1337,194 @@ class rx_ctl (object):
         self.debug = dbglvl
         for tsys in self.trunked_systems:
             self.trunked_systems[tsys].set_debug(dbglvl)
+
+    # ---- MQTT + talkgroup duration tracking ---------------------------------
+
+    def _init_mqtt(self, mqtt_config):
+        """Initialize optional MQTT + Home Assistant discovery publishing."""
+        if HaMqttTalkgroupTotals is None:
+            return
+
+        cfg = mqtt_config or {}
+        host = cfg.get('host') or os.environ.get('OP25_MQTT_HOST')
+        if not host:
+            return
+
+        port = int(cfg.get('port') or os.environ.get('OP25_MQTT_PORT') or 1883)
+        username = cfg.get('username') or os.environ.get('OP25_MQTT_USER') or None
+        password = cfg.get('password') or os.environ.get('OP25_MQTT_PASS') or None
+        base_topic = cfg.get('base_topic') or os.environ.get('OP25_MQTT_BASE_TOPIC') or "op25"
+        discovery_prefix = cfg.get('discovery_prefix') or os.environ.get('OP25_MQTT_DISCOVERY_PREFIX') or "homeassistant"
+        node_id = cfg.get('node_id') or os.environ.get('OP25_MQTT_NODE_ID') or None
+        device_name = cfg.get('device_name') or os.environ.get('OP25_MQTT_DEVICE_NAME') or "OP25"
+        sysname = cfg.get('sysname') or os.environ.get('OP25_MQTT_SYSNAME') or None
+        retain = cfg.get('retain')
+        if retain is None:
+            retain = True
+        debug = bool(cfg.get('debug') or os.environ.get('OP25_MQTT_DEBUG') in ['1','true','True'])
+
+        try:
+            self._mqtt = HaMqttTalkgroupTotals(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                base_topic=base_topic,
+                discovery_prefix=discovery_prefix,
+                node_id=node_id,
+                device_name=device_name,
+                sysname=sysname,
+                retain=bool(retain),
+                debug=debug,
+            )
+            if self.debug > 0:
+                sys.stderr.write("%s MQTT talkgroup totals enabled (broker=%s:%d base_topic=%s)\n" % (log_ts.get(), host, port, base_topic))
+        except Exception as e:
+            self._mqtt = None
+            sys.stderr.write("%s MQTT talkgroup totals disabled (%s)\n" % (log_ts.get(), e))
+
+    def _tg_get_tag(self, tgid, tsys=None):
+        tgid = int(tgid)
+        tag = self._tg_tags.get(tgid, "")
+        if (not tag) and tsys is not None:
+            try:
+                tag = tsys.get_tag(tgid) or ""
+            except Exception:
+                tag = ""
+        if not tag:
+            tag = "TG %d" % tgid
+        return tag
+
+    def _tg_session_start(self, tgid, tsys, curr_time):
+        if tgid is None:
+            return
+        tgid = int(tgid)
+        try:
+            self._tg_tags[tgid] = tsys.get_tag(tgid) or ("TG %d" % tgid)
+            # If sysname wasn't provided at init, learn it from the active system
+            if self._mqtt is not None and getattr(self._mqtt, "sysname", None) in [None, ""]:
+                if hasattr(tsys, "sysname") and tsys.sysname:
+                    self._mqtt.sysname = tsys.sysname
+        except Exception:
+            self._tg_tags[tgid] = self._tg_tags.get(tgid, "TG %d" % tgid)
+
+        if tgid not in self._tg_active_since:
+            self._tg_active_since[tgid] = float(curr_time)
+
+        if self._mqtt is not None:
+            tag = self._tg_get_tag(tgid, tsys)
+            self._mqtt.publish_tg_total(tgid, tag, self.tg_total_seconds.get(tgid, 0.0))
+
+    def _tg_session_end(self, tgid, tsys, curr_time, reason="end"):
+        if tgid is None:
+            return
+        tgid = int(tgid)
+        start = self._tg_active_since.pop(tgid, None)
+        if start is None:
+            return
+        dur = float(curr_time) - float(start)
+        if dur < 0:
+            dur = 0.0
+        self.tg_total_seconds[tgid] = float(self.tg_total_seconds.get(tgid, 0.0)) + dur
+
+        if self._mqtt is not None:
+            tag = self._tg_get_tag(tgid, tsys)
+            self._mqtt.publish_tg_total(tgid, tag, self.tg_total_seconds.get(tgid, 0.0))
+            self._mqtt_publish_snapshot()
+
+    def _mqtt_publish_snapshot(self, force=False):
+        if self._mqtt is None:
+            return
+        now = time.time()
+        if (not force) and (now - self._mqtt_last_snapshot) < self._mqtt_snapshot_interval:
+            return
+        self._mqtt_last_snapshot = now
+        try:
+            self._mqtt.publish_snapshot(self.tg_total_seconds, self._tg_tags)
+        except Exception:
+            pass
+
+    def _mqtt_maybe_reset_daily(self, now_ts):
+        if not self._mqtt_reset_daily:
+            return
+        if self._mqtt_next_reset_ts is None:
+            self._mqtt_next_reset_ts = _next_midnight_ts(now_ts, self._mqtt_tz_name)
+            return
+        if float(now_ts) < float(self._mqtt_next_reset_ts):
+            return
+
+        # Close any active sessions at the reset boundary
+        reset_ts = float(self._mqtt_next_reset_ts)
+        nac = self.current_nac
+        tsys = self.trunked_systems.get(nac) if nac in self.trunked_systems else None
+        if tsys is None and self.trunked_systems:
+            tsys = list(self.trunked_systems.values())[0]
+
+        active_tgids = list(self._tg_active_since.keys())
+        for tgid in active_tgids:
+            # end at reset boundary
+            start = self._tg_active_since.get(tgid)
+            if start is not None and start < reset_ts:
+                # add portion up to reset
+                self._tg_active_since[tgid] = start  # ensure present
+                self._tg_session_end(tgid, tsys, reset_ts, reason="daily_reset")
+                # restart session at midnight if it was active
+                self._tg_active_since[tgid] = reset_ts
+
+        # reset totals
+        self.tg_total_seconds = {}
+
+        # publish zeros for previously seen talkgroups so HA updates immediately
+        if self._mqtt is not None:
+            for tgid, tag in self._tg_tags.items():
+                self._mqtt.publish_tg_total(tgid, tag, 0)
+            self._mqtt_publish_snapshot(force=True)
+
+        self._mqtt_next_reset_ts = _next_midnight_ts(now_ts, self._mqtt_tz_name)
+
+    def tick(self, now_ts=None):
+        """Periodic housekeeping.
+
+        Call this roughly once per second (rx.py / multi_rx.py watchdog).
+        - Maintains scan-mode talkgroup timing based on current state
+        - Publishes running totals while a talkgroup is active
+        - Performs optional daily reset at local midnight
+        """
+        if now_ts is None:
+            now_ts = time.time()
+
+        # Daily reset
+        self._mqtt_maybe_reset_daily(now_ts)
+
+        # Scan-mode timing (single active tgid)
+        if not self.logfile_workers:
+            nac = self.current_nac
+            tsys = self.trunked_systems.get(nac) if nac in self.trunked_systems else None
+            if tsys is None and self.trunked_systems:
+                tsys = list(self.trunked_systems.values())[0]
+
+            if self.current_state in [self.states.TO_VC, self.states.VC] and self.current_tgid is not None:
+                # end any other active talkgroup sessions
+                for tgid in list(self._tg_active_since.keys()):
+                    if int(tgid) != int(self.current_tgid):
+                        self._tg_session_end(tgid, tsys, now_ts, reason="preempt")
+                self._tg_session_start(self.current_tgid, tsys, now_ts)
+            else:
+                # end all sessions when returning to control channel
+                for tgid in list(self._tg_active_since.keys()):
+                    self._tg_session_end(tgid, tsys, now_ts, reason="return_cc")
+
+            # Publish a running total for the active tgid (throttled by snapshot interval)
+            if self._mqtt is not None and self.current_tgid is not None and self.current_tgid in self._tg_active_since:
+                start = self._tg_active_since.get(self.current_tgid)
+                if start is not None:
+                    tag = self._tg_get_tag(self.current_tgid, tsys)
+                    # Throttle per-talkgroup publishes; final totals are published on call end
+                    if (float(now_ts) - float(self._mqtt_last_state_publish)) >= float(self._mqtt_snapshot_interval):
+                        self._mqtt_last_state_publish = float(now_ts)
+                        running = float(self.tg_total_seconds.get(self.current_tgid, 0.0)) + (float(now_ts) - float(start))
+                        self._mqtt.publish_tg_total(self.current_tgid, tag, running)
+                        self._mqtt_publish_snapshot()
 
     def add_receiver(self, msgq_id, config, meta_q = None, freq = 0):
         self.config = config
@@ -1759,6 +1997,10 @@ class rx_ctl (object):
                     sys.stderr.write("%s new tgid %d slot %s arriving on already active frequency %d\n" % (log_ts.get(curr_time), tgid, tdma_slot, frequency))
                     previous_tgid = [id for id in tgids if tgids[id]['tdma_slot'] == tdma_slot]
                     assert len(previous_tgid) == 1   ## check for logic error
+                    old_tgid = previous_tgid[0]
+                    still_active_elsewhere = any((f != frequency and old_tgid in self.working_frequencies[f]['tgids']) for f in self.working_frequencies)
+                    if not still_active_elsewhere:
+                        self._tg_session_end(old_tgid, tsys, curr_time, reason="slot_reuse")
                     self.free_talkgroup(frequency, previous_tgid[0], curr_time)
                     worker = self.working_frequencies[frequency]['worker']
             else:
@@ -1770,6 +2012,7 @@ class rx_ctl (object):
                 worker['demod'].set_relative_frequency(tsys.center_frequency - frequency)
                 sys.stderr.write('%s starting worker frequency %d tg %d slot %s\n' % (log_ts.get(curr_time), frequency, tgid, tdma_slot))
             self.working_frequencies[frequency]['tgids'][tgid] = {'updated': curr_time, 'tdma_slot': tdma_slot}
+            self._tg_session_start(tgid, tsys, curr_time)
             if not update:
                 continue
             filename = 'tgid-%d-%f.wav' % (tgid, curr_time)
@@ -1805,6 +2048,7 @@ class rx_ctl (object):
                 gc_frequencies += [frequency]
             gc_tgids += inactive_tgids
         for frequency, tgid in gc_tgids:    # expire talkgroups
+            self._tg_session_end(tgid, tsys, curr_time, reason="inactive")
             self.free_talkgroup(frequency, tgid, curr_time)
         for frequency in gc_frequencies:    # expire working frequencies
             self.free_frequency(frequency, curr_time)
@@ -1817,6 +2061,7 @@ class rx_ctl (object):
         if nac is None or nac not in self.trunked_systems:
             return
         tsys = self.trunked_systems[nac]
+        prev_tgid = self.current_tgid
 
         new_frequency = None
         new_tgid = None
@@ -1832,6 +2077,7 @@ class rx_ctl (object):
             elif self.current_state != self.states.CC:
                 if self.debug > 1:
                     sys.stderr.write("%s voice timeout\n" % log_ts.get())
+                self._tg_session_end(self.current_tgid, tsys, curr_time, reason="timeout")
                 if self.hold_mode is False:
                     self.current_tgid = None
                 self.current_srcaddr = 0
@@ -1847,6 +2093,7 @@ class rx_ctl (object):
             if (self.crypt_behavior > 1) and self.current_tgid is not None and self.current_encrypted:
                 if self.debug > 1:
                     sys.stderr.write("%s skip encrypted call: tg(%d)\n" % (log_ts.get(), self.current_tgid))
+                self._tg_session_end(self.current_tgid, tsys, curr_time, reason="encrypted_skip")
                 self.current_srcaddr = 0
                 self.current_grpaddr = 0
                 self.current_encrypted = 0
@@ -1874,6 +2121,7 @@ class rx_ctl (object):
                         sys.stderr.write("%s voice update:  tg(%s), freq(%s), slot(%s), prio(%d)\n" % (log_ts.get(), new_tgid, new_frequency, tslot, tsys.get_prio(new_tgid)))
                     new_state = self.states.TO_VC
                     self.current_tgid = new_tgid
+                    self._tg_session_start(new_tgid, tsys, curr_time)
                     self.current_srcaddr = srcaddr
                     self.tgid_hold = new_tgid
                     self.tgid_hold_until = max(curr_time + self.TGID_HOLD_TIME, self.tgid_hold_until)
@@ -1891,7 +2139,9 @@ class rx_ctl (object):
                             tslot = tdma_slot if tdma_slot is not None else '-'
                             sys.stderr.write("%s voice preempt: tg(%s), freq(%s), slot(%s), prio(%d)\n" % (log_ts.get(), new_tgid, new_frequency, tslot, tsys.get_prio(new_tgid)))
                         new_state = self.states.TO_VC
+                        self._tg_session_end(prev_tgid, tsys, curr_time, reason="preempt")
                         self.current_tgid = new_tgid
+                        self._tg_session_start(new_tgid, tsys, curr_time)
                         self.current_srcaddr = srcaddr
                         self.tgid_hold = new_tgid
                         self.tgid_hold_until = max(curr_time + self.TGID_HOLD_TIME, self.tgid_hold_until)
@@ -1912,6 +2162,7 @@ class rx_ctl (object):
             if self.current_state != self.states.CC:
                 if self.debug > 1:
                     sys.stderr.write("%s %s, tg(%d)\n" % (log_ts.get(), command, self.current_tgid))
+                self._tg_session_end(self.current_tgid, tsys, curr_time, reason=command)
                 self.current_srcaddr = 0
                 self.current_grpaddr = 0
                 self.current_encrypted = 0
@@ -1966,6 +2217,7 @@ class rx_ctl (object):
                     tsys.add_skiplist(self.current_tgid, end_time=end_time)
                 else:
                     tsys.add_blacklist(self.current_tgid, end_time=end_time)
+                self._tg_session_end(self.current_tgid, tsys, curr_time, reason=command)
                 self.current_tgid = None
                 self.current_srcaddr = 0
                 self.current_grpaddr = 0
@@ -1993,6 +2245,7 @@ class rx_ctl (object):
                 return
             tsys.add_whitelist(cmd_data)
             if self.current_tgid and tsys.whitelist and self.current_tgid not in tsys.whitelist:
+                self._tg_session_end(self.current_tgid, tsys, curr_time, reason="whitelist_filter")
                 self.current_tgid = None
                 self.tgid_hold = None
                 self.tgid_hold_until = curr_time

@@ -551,7 +551,7 @@ class rx_block (gr.top_block):
 
     # Initialize the receiver
     #
-    def __init__(self, verbosity, config):
+    def __init__(self, verbosity, config, mqtt_config=None):
         self.config = config
         self.verbosity = verbosity
         self.devices = []
@@ -565,6 +565,7 @@ class rx_block (gr.top_block):
         self.metadata = None
         self.meta_streams = {}
         self.trunking = None
+        self._mqtt_config = mqtt_config
         self.du_watcher = None
         self.rx_q = gr.msg_queue(100)
         self.ui_in_q = gr.msg_queue(100)
@@ -678,7 +679,20 @@ class rx_block (gr.top_block):
             self.trunking = None
 
         if self.trunking is not None:
-            self.trunk_rx = self.trunking.rx_ctl(frequency_set = self.change_freq, nbfm_ctrl = self.nbfm_control, fa_ctrl = self.fa_control, debug = self.verbosity, chans = config['chans'])
+            mqtt_cfg = None
+            try:
+                mqtt_cfg = config.get('mqtt', None)
+            except Exception:
+                mqtt_cfg = None
+            if getattr(self, '_mqtt_config', None):
+                if mqtt_cfg:
+                    m = dict(mqtt_cfg)
+                    m.update(self._mqtt_config)
+                    mqtt_cfg = m
+                else:
+                    mqtt_cfg = self._mqtt_config
+
+            self.trunk_rx = self.trunking.rx_ctl(frequency_set = self.change_freq, nbfm_ctrl = self.nbfm_control, fa_ctrl = self.fa_control, debug = self.verbosity, chans = config['chans'], mqtt_config=mqtt_cfg)
             self.du_watcher = du_queue_watcher(self.rx_q, self.trunk_rx.process_qmsg)
             sys.stderr.write("Enabled trunking module: %s\n" % config['module'])
 
@@ -914,6 +928,13 @@ class rx_block (gr.top_block):
             # TODO: find a better way to invoke
             for chan in self.channels:
                 chan.error_tracking()
+
+            # Periodic housekeeping for trunking (talkgroup totals, MQTT publishing, etc.)
+            try:
+                if self.trunk_rx is not None:
+                    self.trunk_rx.tick(time.time())
+            except Exception:
+                pass
         elif s in RX_COMMANDS:
             if self.trunking is not None and self.trunk_rx is not None:
                 self.trunk_rx.ui_command(s, msg.arg1(), msg.arg2())
@@ -1030,7 +1051,38 @@ class rx_main(object):
         parser.add_option("-v", "--verbosity", type="int", default=0, help="message debug level")
         parser.add_option("-p", "--pause", action="store_true", default=False, help="block on startup")
         parser.add_option("-d", "--dev-mode", action="store_true", default=False, help="enable developer mode")
+        # MQTT + Home Assistant talkgroup totals publishing (optional)
+        parser.add_option("--mqtt-host", type="string", default=None, help="MQTT broker host (enables talkgroup total time publishing)")
+        parser.add_option("--mqtt-port", type="int", default=1883, help="MQTT broker port")
+        parser.add_option("--mqtt-user", type="string", default=None, help="MQTT username")
+        parser.add_option("--mqtt-pass", type="string", default=None, help="MQTT password")
+        parser.add_option("--mqtt-base-topic", type="string", default="op25", help="MQTT base topic (default: op25)")
+        parser.add_option("--mqtt-discovery-prefix", type="string", default="homeassistant", help="Home Assistant MQTT discovery prefix")
+        parser.add_option("--mqtt-node-id", type="string", default=None, help="HA device identifier (default: op25_<hostname>)")
+        parser.add_option("--mqtt-device-name", type="string", default="OP25", help="HA device name")
+        parser.add_option("--mqtt-sysname", type="string", default=None, help="Optional system name override (appended in entity names)")
+        parser.add_option("--mqtt-debug", action="store_true", default=False, help="Enable MQTT debug logging")
+        parser.add_option("--mqtt-reset-daily", action="store_true", default=False, help="Reset talkgroup totals daily at midnight (local tz)")
+        parser.add_option("--mqtt-tz", type="string", default="America/Chicago", help="Timezone for daily reset (default: America/Chicago)")
+
         (options, args) = parser.parse_args()
+        mqtt_config = None
+        if getattr(options, 'mqtt_host', None):
+            mqtt_config = {
+                'host': options.mqtt_host,
+                'port': getattr(options, 'mqtt_port', 1883),
+                'username': getattr(options, 'mqtt_user', None),
+                'password': getattr(options, 'mqtt_pass', None),
+                'base_topic': getattr(options, 'mqtt_base_topic', 'op25'),
+                'discovery_prefix': getattr(options, 'mqtt_discovery_prefix', 'homeassistant'),
+                'node_id': getattr(options, 'mqtt_node_id', None),
+                'device_name': getattr(options, 'mqtt_device_name', 'OP25'),
+                'sysname': getattr(options, 'mqtt_sysname', None),
+                'debug': getattr(options, 'mqtt_debug', False),
+                'reset_daily': getattr(options, 'mqtt_reset_daily', False),
+                'tz': getattr(options, 'mqtt_tz', 'America/Chicago'),
+            }
+
 
         #if options.dev_mode:
         #    globals()["p25_demodulator"] = importlib.import_module("p25_demodulator_dev")
@@ -1056,7 +1108,7 @@ class rx_main(object):
                 config = json.loads(open(options.config_file).read())
             else:
                 config = json.loads(open(options.config_file, encoding="utf-8-sig").read())
-        self.tb = rx_block(options.verbosity, config = byteify(config))
+        self.tb = rx_block(options.verbosity, config = byteify(config), mqtt_config=mqtt_config)
         self.q_watcher = du_queue_watcher(self.tb.ui_out_q, self.process_qmsg)
         sys.stderr.write('python version detected: %s\n' % sys.version)
 

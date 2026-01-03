@@ -376,7 +376,24 @@ class p25_rx_block (gr.top_block):
                 logfile_workers.append({'demod': demod, 'decoder': decoder, 'active': False})
                 self.connect(source, demod, decoder)
 
-        self.trunk_rx = trunking.rx_ctl(frequency_set = self.change_freq, fa_ctrl = self.control, debug = self.options.verbosity, conf_file = self.options.trunk_conf_file, logfile_workers=logfile_workers, meta_update = self.meta_update, crypt_behavior = self.options.crypt_behavior)
+        mqtt_config = None
+        if getattr(self.options, 'mqtt_host', None):
+            mqtt_config = {
+                'host': self.options.mqtt_host,
+                'port': getattr(self.options, 'mqtt_port', 1883),
+                'username': getattr(self.options, 'mqtt_user', None),
+                'password': getattr(self.options, 'mqtt_pass', None),
+                'base_topic': getattr(self.options, 'mqtt_base_topic', 'op25'),
+                'discovery_prefix': getattr(self.options, 'mqtt_discovery_prefix', 'homeassistant'),
+                'node_id': getattr(self.options, 'mqtt_node_id', None),
+                'device_name': getattr(self.options, 'mqtt_device_name', 'OP25'),
+                'sysname': getattr(self.options, 'mqtt_sysname', None),
+                'debug': getattr(self.options, 'mqtt_debug', False),
+                'reset_daily': getattr(self.options, 'mqtt_reset_daily', False),
+                'tz': getattr(self.options, 'mqtt_tz', 'America/Chicago'),
+            }
+
+        self.trunk_rx = trunking.rx_ctl(frequency_set = self.change_freq, fa_ctrl = self.control, debug = self.options.verbosity, conf_file = self.options.trunk_conf_file, logfile_workers=logfile_workers, meta_update = self.meta_update, crypt_behavior = self.options.crypt_behavior, mqtt_config=mqtt_config)
 
         self.du_watcher = du_queue_watcher(self.rx_q, self.trunk_rx.process_qmsg)
 
@@ -982,6 +999,13 @@ class p25_rx_block (gr.top_block):
                     sys.stderr.write("%s UI Timeout\n" % log_ts.get())
                 self.toggle_plot(0)
 
+            # Periodic housekeeping for trunking (talkgroup totals, MQTT publishing, etc.)
+            try:
+                if self.trunk_rx is not None:
+                    self.trunk_rx.tick(time.time())
+            except Exception:
+                pass
+
         elif s in RX_COMMANDS:
             if not self.rx_q.full_p():
                 self.rx_q.insert_tail(msg)
@@ -1100,6 +1124,20 @@ class rx_main(object):
         parser.add_option("-2", "--phase2-tdma", action="store_true", default=False, help="enable phase2 tdma decode")
         parser.add_option("--tdma-cc", action="store_true", default=False, help="enable tdma control channel")
         parser.add_option("-Z", "--decim-amt", type="int", default=1, help="spectrum decimation")
+        # MQTT + Home Assistant talkgroup totals publishing (optional)
+        parser.add_option("--mqtt-host", type="string", default=None, help="MQTT broker host (enables talkgroup total time publishing)")
+        parser.add_option("--mqtt-port", type="int", default=1883, help="MQTT broker port")
+        parser.add_option("--mqtt-user", type="string", default=None, help="MQTT username")
+        parser.add_option("--mqtt-pass", type="string", default=None, help="MQTT password")
+        parser.add_option("--mqtt-base-topic", type="string", default="op25", help="MQTT base topic (default: op25)")
+        parser.add_option("--mqtt-discovery-prefix", type="string", default="homeassistant", help="Home Assistant MQTT discovery prefix")
+        parser.add_option("--mqtt-node-id", type="string", default=None, help="HA device identifier (default: op25_<hostname>)")
+        parser.add_option("--mqtt-device-name", type="string", default="OP25", help="HA device name")
+        parser.add_option("--mqtt-sysname", type="string", default=None, help="Optional system name override (appended in entity names)")
+        parser.add_option("--mqtt-debug", action="store_true", default=False, help="Enable MQTT debug logging")
+        parser.add_option("--mqtt-reset-daily", action="store_true", default=False, help="Reset talkgroup totals daily at midnight (local tz)")
+        parser.add_option("--mqtt-tz", type="string", default="America/Chicago", help="Timezone for daily reset (default: America/Chicago)")
+
         (options, args) = parser.parse_args()
         if len(args) != 0:
             parser.print_help()
