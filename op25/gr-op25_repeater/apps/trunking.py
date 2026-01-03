@@ -1362,6 +1362,7 @@ class rx_ctl (object):
         if retain is None:
             retain = True
         debug = bool(cfg.get('debug') or os.environ.get('OP25_MQTT_DEBUG') in ['1','true','True'])
+        entity_store_path = cfg.get('entity_store_path') or os.environ.get('OP25_MQTT_ENTITY_STORE') or None
 
         try:
             self._mqtt = HaMqttTalkgroupTotals(
@@ -1376,6 +1377,7 @@ class rx_ctl (object):
                 sysname=sysname,
                 retain=bool(retain),
                 debug=debug,
+                entity_store_path=entity_store_path,
             )
             if self.debug > 0:
                 sys.stderr.write("%s MQTT talkgroup totals enabled (broker=%s:%d base_topic=%s)\n" % (log_ts.get(), host, port, base_topic))

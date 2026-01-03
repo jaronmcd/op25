@@ -2,3 +2,4 @@
 build/
 *.pyc
 op25/gr-op25_repeater/apps/ramsey.tgid
+op25/gr-op25_repeater/apps/ramsey.tgid
