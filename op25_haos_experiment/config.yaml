@@ -1,0 +1,43 @@
+name: OP25 (MQTT Talkgroup Totals) [Experiment]
+slug: op25_haos_experiment
+description: Run OP25 with optional Home Assistant MQTT discovery + daily talkgroup total-time sensors.
+version: "0.1.0"
+arch:
+  - amd64
+  - aarch64
+startup: application
+stage: stable
+usb: true
+map:
+  - type: share
+    read_only: false
+  - type: homeassistant_config
+    read_only: false
+options:
+  command: "./multi_rx.py -v 1 -c /share/op25/p25_single_rtl_example.json"
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_pass: ""
+  mqtt_base_topic: "op25"
+  mqtt_discovery_prefix: "homeassistant"
+  mqtt_node_id: ""
+  mqtt_device_name: "OP25"
+  mqtt_sysname: ""
+  mqtt_debug: false
+  mqtt_reset_daily: true
+  mqtt_tz: "America/Chicago"
+schema:
+  command: str
+  mqtt_host: str?
+  mqtt_port: int?
+  mqtt_user: str?
+  mqtt_pass: password?
+  mqtt_base_topic: str?
+  mqtt_discovery_prefix: str?
+  mqtt_node_id: str?
+  mqtt_device_name: str?
+  mqtt_sysname: str?
+  mqtt_debug: bool?
+  mqtt_reset_daily: bool?
+  mqtt_tz: str?
