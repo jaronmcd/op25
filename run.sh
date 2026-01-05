@@ -48,4 +48,42 @@ cd "${APPS_DIR}"
 echo "/usr/bin/python3" > op25_python || true
 
 bashio::log.info "[RUN] python3 ./rx.py ${RX_ARGS_FINAL}"
-exec python3 ./rx.py ${RX_ARGS_FINAL}
+# HA add-ons run under s6 overlay which sometimes provides sys.stderr as a raw FileIO
+# (no .detach()). OP25 rx.py calls sys.stderr.detach().detach(), which can crash.
+# This wrapper ensures stdout/stderr are TextIOWrapper instances with a working detach().
+exec python3 - <<'PY'
+import io
+import os
+import runpy
+import shlex
+import sys
+
+
+def _wrap_text_stream(name: str) -> None:
+    # OP25's rx.py does: sys.stderr = TextIOWrapper(sys.stderr.detach().detach(), ...)
+    # In HA add-ons, stdout/stderr may be a BufferedWriter or FileIO, which can break that.
+    # Ensure we always provide a TextIOWrapper so rx.py's detach().detach() works.
+    stream = getattr(sys, name)
+    if isinstance(stream, io.TextIOBase):
+        return
+    try:
+        fd = stream.fileno()
+    except Exception:
+        return
+    try:
+        raw = os.fdopen(fd, "wb", closefd=False, buffering=0)
+        buffered = io.BufferedWriter(raw)
+        text = io.TextIOWrapper(buffered, encoding="utf-8", errors="replace", write_through=True)
+        setattr(sys, name, text)
+    except Exception:
+        return
+
+
+_wrap_text_stream("stdout")
+_wrap_text_stream("stderr")
+
+args = os.environ.get("RX_ARGS_FINAL", "")
+sys.argv = ["rx.py"] + shlex.split(args)
+
+runpy.run_path("./rx.py", run_name="__main__")
+PY

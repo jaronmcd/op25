@@ -1,6 +1,6 @@
 name: "OP25 P25 Scanner"
 slug: op25
-version: "0.1.0"
+version: "0.1.4"
 description: "OP25 (GNU Radio) P25 Phase I/II trunking receiver with web UI"
 url: "https://github.com/yourname/op25-haos-addon"
 arch:
