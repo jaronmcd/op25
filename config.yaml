@@ -1,0 +1,37 @@
+name: "OP25 P25 Scanner"
+slug: op25
+version: "0.1.0"
+description: "OP25 (GNU Radio) P25 Phase I/II trunking receiver with web UI"
+url: "https://github.com/yourname/op25-haos-addon"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+usb: true
+map:
+  - share:rw
+  - config:rw
+ports:
+  8080/tcp: 8080
+ports_description:
+  8080/tcp: "OP25 Web UI"
+webui: "http://[HOST]:[PORT:8080]/"
+
+options:
+  workdir: "/share/op25"
+  http_host: "0.0.0.0"
+  http_port: 8080
+  # Everything after rx.py. You can use either RTL-SDR (rtl=0) or Soapy (soapy=0,driver=rtlsdr,...)
+  # Example (single frequency):
+  #   --args rtl=0 -S 2400000 -o 25000 -q 0 -N RF:42 -f 853.3625e6 -V -2 -U
+  # Example (trunking):
+  #   --args rtl=0 -S 2400000 -o 25000 -q 0 -N RF:42 -T /share/op25/trunk.tsv -V -2 -U
+  rx_args: "--args rtl=0 -S 2400000 -o 25000 -q 0 -N RF:42 -T /share/op25/trunk.tsv -V -2 -U"
+
+schema:
+  workdir: str
+  http_host: str
+  http_port: int(1,65535)
+  rx_args: str
